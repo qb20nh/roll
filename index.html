@@ -1,0 +1,460 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Parallel Rigid Body Simulation (16x)</title>
+    <style>
+        body {
+            margin: 0;
+            overflow: hidden;
+            background-color: #1a1a1a;
+            color: #eee;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            height: 100vh;
+        }
+
+        canvas {
+            box-shadow: 0 0 20px rgba(0,0,0,0.5);
+            border-radius: 4px;
+            background-color: #222;
+        }
+
+        #ui-layer {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            pointer-events: none;
+            background: rgba(0, 0, 0, 0.8);
+            padding: 15px;
+            border-radius: 8px;
+            border: 1px solid #444;
+            min-width: 250px;
+            backdrop-filter: blur(4px);
+        }
+
+        h1 {
+            font-size: 16px;
+            margin: 0 0 10px 0;
+            color: #4db8ff;
+            text-transform: uppercase;
+            letter-spacing: 1px;
+        }
+
+        .stat-row {
+            display: flex;
+            justify-content: space-between;
+            font-size: 13px;
+            margin-bottom: 5px;
+            font-family: 'Courier New', monospace;
+        }
+
+        .label { color: #888; }
+        .value { color: #fff; font-weight: bold; }
+
+        #energy-graph {
+            margin-top: 10px;
+            width: 100%;
+            height: 60px;
+            background: #111;
+            border: 1px solid #333;
+            position: relative;
+        }
+
+        .controls {
+            position: absolute;
+            bottom: 20px;
+            display: flex;
+            gap: 10px;
+        }
+
+        button {
+            pointer-events: auto;
+            background: #444;
+            color: white;
+            border: 1px solid #666;
+            padding: 8px 16px;
+            cursor: pointer;
+            border-radius: 4px;
+            font-size: 14px;
+            transition: background 0.2s;
+        }
+
+        button:hover { background: #555; }
+        button:active { background: #4db8ff; border-color: #4db8ff; }
+
+    </style>
+</head>
+<body>
+
+    <div id="ui-layer">
+        <h1>Multiverse Stats (16x)</h1>
+        <div class="stat-row">
+            <span class="label">Systems Active:</span>
+            <span class="value">16</span>
+        </div>
+        <div class="stat-row">
+            <span class="label">Total Energy (Sum):</span>
+            <span class="value" id="total-e">0.00</span>
+        </div>
+        <div class="stat-row">
+            <span class="label">Avg Deviation:</span>
+            <span class="value" id="deviation" style="color: #0f0">0.00%</span>
+        </div>
+        <canvas id="energy-graph"></canvas>
+    </div>
+
+    <canvas id="simCanvas"></canvas>
+
+    <div class="controls">
+        <button onclick="resetAll()">Reset Multiverse</button>
+        <button onclick="toggleTrails()">Toggle Trails</button>
+    </div>
+
+<script>
+/**
+ * Parallel Precision Physics Engine
+ * Simulates 16 independent rigid body systems to visualize chaos theory.
+ */
+
+const canvas = document.getElementById('simCanvas');
+const ctx = canvas.getContext('2d', { alpha: false });
+const graphCanvas = document.getElementById('energy-graph');
+const graphCtx = graphCanvas.getContext('2d');
+
+// --- Physics Constants ---
+const SUB_STEPS = 16; 
+const GRAVITY = 9.81 * 100;
+const CONTAINER_RADIUS = 300;
+const BALL_RADIUS = 30;
+const BALL_MASS = 10;
+const CONTAINER_MASS = 200;
+const RESTITUTION_NORMAL = 1.0; 
+const RESTITUTION_TANGENT = 1.0; 
+
+// --- Simulation Class ---
+class SimSystem {
+    constructor(id) {
+        this.id = id;
+        this.ball = {};
+        this.container = {};
+        this.initialEnergy = 0;
+        this.reset();
+    }
+
+    reset() {
+        // Chaos Seed: tiny offset in X
+        const randomOffset = (Math.random() * 0.2) - 0.1;
+        
+        this.ball = {
+            x: 1 + randomOffset, 
+            y: -220,
+            vx: 0, vy: 0,
+            angle: 0, angularVelocity: 0,
+            radius: BALL_RADIUS, mass: BALL_MASS, 
+            inertia: 0.5 * BALL_MASS * (BALL_RADIUS * BALL_RADIUS),
+            history: []
+        };
+
+        this.container = {
+            angle: 0, angularVelocity: 0,
+            radius: CONTAINER_RADIUS, mass: CONTAINER_MASS,
+            inertia: CONTAINER_MASS * (CONTAINER_RADIUS * CONTAINER_RADIUS)
+        };
+
+        this.initialEnergy = this.calculateEnergy().total;
+    }
+
+    calculateEnergy() {
+        const b = this.ball;
+        const c = this.container;
+
+        const v2 = b.vx * b.vx + b.vy * b.vy;
+        const keLin = 0.5 * b.mass * v2;
+        const keRotB = 0.5 * b.inertia * (b.angularVelocity * b.angularVelocity);
+        const keRotC = 0.5 * c.inertia * (c.angularVelocity * c.angularVelocity);
+        const pe = -b.mass * GRAVITY * b.y;
+
+        return {
+            total: keLin + keRotB + keRotC + pe,
+            pe: pe
+        };
+    }
+
+    update(dt) {
+        const subDt = dt / SUB_STEPS;
+        const b = this.ball;
+        const c = this.container;
+
+        for (let i = 0; i < SUB_STEPS; i++) {
+            // Integration
+            b.vy += GRAVITY * subDt;
+            b.x += b.vx * subDt;
+            b.y += b.vy * subDt;
+            b.angle += b.angularVelocity * subDt;
+            c.angle += c.angularVelocity * subDt;
+
+            // Collision
+            const distSq = b.x*b.x + b.y*b.y;
+            const dist = Math.sqrt(distSq);
+            const maxDist = c.radius - b.radius;
+
+            if (dist >= maxDist) {
+                const nx = b.x / dist;
+                const ny = b.y / dist;
+
+                // Fix Penetration
+                const pen = dist - maxDist;
+                b.x -= nx * pen;
+                b.y -= ny * pen;
+
+                // Tangent
+                const tx = -ny;
+                const ty = nx;
+
+                // Velocities
+                const vn = b.vx * nx + b.vy * ny;
+                
+                const vt_ball_surf = (b.vx * tx + b.vy * ty) + b.angularVelocity * b.radius;
+                const vt_wall_surf = c.angularVelocity * c.radius;
+                const v_rel_tan = vt_ball_surf - vt_wall_surf;
+
+                if (vn > 0) {
+                    // Normal Impulse
+                    const jn = -(1 + RESTITUTION_NORMAL) * vn * b.mass;
+                    b.vx += (jn * nx) / b.mass;
+                    b.vy += (jn * ny) / b.mass;
+
+                    // Tangent Impulse
+                    const invM = 1 / b.mass;
+                    const invIb = (b.radius * b.radius) / b.inertia;
+                    const invIw = (c.radius * c.radius) / c.inertia;
+                    const effMass = 1 / (invM + invIb + invIw);
+
+                    const jt = -(1 + RESTITUTION_TANGENT) * v_rel_tan * effMass;
+
+                    // Apply
+                    b.vx += (jt * tx) / b.mass;
+                    b.vy += (jt * ty) / b.mass;
+                    b.angularVelocity += (jt * b.radius) / b.inertia;
+                    c.angularVelocity -= (jt * c.radius) / c.inertia;
+                }
+            }
+        }
+        
+        this.correctEnergy();
+    }
+
+    correctEnergy() {
+        if (!this.initialEnergy) return;
+        const stats = this.calculateEnergy();
+        const currentKE = stats.total - stats.pe;
+        const targetKE = this.initialEnergy - stats.pe;
+
+        if (targetKE > 0 && currentKE > 0.000001) {
+            const reqScale = Math.sqrt(targetKE / currentKE);
+            // 10% correction per frame for stability
+            const smoothScale = 1 + (reqScale - 1) * 0.1;
+            
+            this.ball.vx *= smoothScale;
+            this.ball.vy *= smoothScale;
+            this.ball.angularVelocity *= smoothScale;
+            this.container.angularVelocity *= smoothScale;
+        }
+    }
+}
+
+// --- Main App ---
+
+const systems = [];
+for(let i=0; i<16; i++) {
+    systems.push(new SimSystem(i));
+}
+
+let showTrails = true;
+let totalInitialEnergy = 0;
+let energyHistory = [];
+let layoutScale = 1;
+
+function resize() {
+    canvas.width = window.innerWidth;
+    canvas.height = window.innerHeight;
+    graphCanvas.width = graphCanvas.offsetWidth;
+    graphCanvas.height = graphCanvas.offsetHeight;
+    
+    // Calculate layout scale
+    // We need 4 rows. 
+    // Container Radius is 300. Diameter 600.
+    // With padding, let's say 650 units per cell.
+    // 4 cells high = 2600 units world space.
+    // Screen height / 2600 = scale.
+    const cols = 4; 
+    const rows = 4;
+    const cellUnitSize = (CONTAINER_RADIUS * 2) * 1.1; // 10% padding
+    
+    // Fit width or height
+    const scaleH = window.innerHeight / (rows * cellUnitSize);
+    const scaleW = window.innerWidth / (cols * cellUnitSize);
+    layoutScale = Math.min(scaleH, scaleW) * 0.95; // 95% to leave margin
+}
+window.addEventListener('resize', resize);
+resize();
+
+function resetAll() {
+    systems.forEach(s => s.reset());
+    systems.forEach(s => s.ball.history = []);
+    energyHistory = [];
+    totalInitialEnergy = systems.reduce((sum, s) => sum + s.initialEnergy, 0);
+}
+
+function updateGraph(currentTotal) {
+    if (!totalInitialEnergy) return;
+    
+    energyHistory.push(currentTotal);
+    if (energyHistory.length > graphCanvas.width) energyHistory.shift();
+    
+    const w = graphCanvas.width;
+    const h = graphCanvas.height;
+    
+    graphCtx.clearRect(0, 0, w, h);
+    
+    // Baseline
+    graphCtx.beginPath();
+    graphCtx.strokeStyle = '#444';
+    graphCtx.setLineDash([5, 5]);
+    graphCtx.moveTo(0, h/2);
+    graphCtx.lineTo(w, h/2);
+    graphCtx.stroke();
+    graphCtx.setLineDash([]);
+    
+    // Plot
+    graphCtx.beginPath();
+    graphCtx.strokeStyle = '#0f0';
+    graphCtx.lineWidth = 2;
+    const scale = 5000; // Zoomed in deviation
+    
+    for (let i = 0; i < energyHistory.length; i++) {
+        const val = energyHistory[i];
+        const diff = (val - totalInitialEnergy) / totalInitialEnergy;
+        const y = (h/2) - (diff * (h/2) * scale);
+        if(i===0) graphCtx.moveTo(i, y);
+        else graphCtx.lineTo(i, y);
+    }
+    graphCtx.stroke();
+}
+
+function loop() {
+    const dt = 1/180;
+    
+    // Update
+    let currentTotalEnergy = 0;
+    systems.forEach(s => {
+        s.update(dt);
+        currentTotalEnergy += s.calculateEnergy().total;
+    });
+    
+    // Update Stats
+    if(totalInitialEnergy === 0) totalInitialEnergy = currentTotalEnergy;
+    document.getElementById('total-e').innerText = (currentTotalEnergy / 1000).toFixed(1) + "k";
+    
+    const dev = ((currentTotalEnergy - totalInitialEnergy) / totalInitialEnergy) * 100;
+    const devEl = document.getElementById('deviation');
+    devEl.innerText = (dev > 0 ? "+" : "") + dev.toPrecision(3) + "%";
+    
+    updateGraph(currentTotalEnergy);
+    
+    // Render
+    ctx.fillStyle = '#222';
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+    
+    const rows = 4;
+    const cols = 4;
+    const cellW = canvas.width / cols;
+    const cellH = canvas.height / rows;
+    
+    systems.forEach((s, i) => {
+        const col = i % cols;
+        const row = Math.floor(i / cols);
+        
+        const cx = col * cellW + cellW/2;
+        const cy = row * cellH + cellH/2;
+        
+        ctx.save();
+        ctx.translate(cx, cy);
+        ctx.scale(layoutScale, layoutScale);
+        
+        // Draw Container
+        ctx.save();
+        ctx.rotate(s.container.angle);
+        ctx.beginPath();
+        ctx.arc(0, 0, s.container.radius, 0, Math.PI * 2);
+        ctx.lineWidth = 4;
+        ctx.strokeStyle = '#555';
+        ctx.stroke();
+        
+        // Spokes (simplified)
+        ctx.strokeStyle = '#333';
+        ctx.lineWidth = 2;
+        ctx.beginPath();
+        ctx.moveTo(-s.container.radius, 0);
+        ctx.lineTo(s.container.radius, 0);
+        ctx.moveTo(0, -s.container.radius);
+        ctx.lineTo(0, s.container.radius);
+        ctx.stroke();
+        ctx.restore();
+        
+        // Draw Trail
+        if (showTrails) {
+            s.ball.history.push({x: s.ball.x, y: s.ball.y});
+            if (s.ball.history.length > 200) s.ball.history.shift();
+            
+            ctx.beginPath();
+            ctx.strokeStyle = `hsl(${(i * 360/16)}, 70%, 60%)`; // Different color per instance
+            ctx.lineWidth = 3;
+            for (let k = 0; k < s.ball.history.length - 1; k++) {
+                ctx.moveTo(s.ball.history[k].x, s.ball.history[k].y);
+                ctx.lineTo(s.ball.history[k+1].x, s.ball.history[k+1].y);
+            }
+            ctx.stroke();
+        }
+        
+        // Draw Ball
+        ctx.save();
+        ctx.translate(s.ball.x, s.ball.y);
+        ctx.rotate(s.ball.angle);
+        
+        ctx.beginPath();
+        ctx.arc(0, 0, s.ball.radius, 0, Math.PI * 2);
+        ctx.fillStyle = '#eee';
+        ctx.fill();
+        
+        // Orientation
+        ctx.beginPath();
+        ctx.moveTo(0, 0);
+        ctx.lineTo(s.ball.radius, 0);
+        ctx.strokeStyle = '#000';
+        ctx.lineWidth = 3;
+        ctx.stroke();
+        
+        ctx.restore(); // Ball
+        ctx.restore(); // Cell
+    });
+
+    requestAnimationFrame(loop);
+}
+
+function toggleTrails() {
+    showTrails = !showTrails;
+    if(!showTrails) systems.forEach(s => s.ball.history = []);
+}
+
+resetAll();
+requestAnimationFrame(loop);
+
+</script>
+</body>
+</html>
