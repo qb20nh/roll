@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Parallel Rigid Body Simulation (16x)</title>
+    <title>Parallel Rigid Body Simulation (64x)</title>
     <style>
         body {
             margin: 0;
@@ -92,10 +92,14 @@
 <body>
 
     <div id="ui-layer">
-        <h1>Multiverse Stats (16x)</h1>
+        <h1>Multiverse Stats (64x)</h1>
         <div class="stat-row">
             <span class="label">Systems Active:</span>
-            <span class="value">16</span>
+            <span class="value">64</span>
+        </div>
+        <div class="stat-row">
+            <span class="label">Workers:</span>
+            <span class="value" id="worker-count">0</span>
         </div>
         <div class="stat-row">
             <span class="label">Total Energy (Sum):</span>
@@ -106,6 +110,21 @@
             <span class="value" id="deviation" style="color: #0f0">0.00%</span>
         </div>
         <canvas id="energy-graph"></canvas>
+        
+        <div id="overlay-stats" style="display: none; margin-top: 10px; padding-top: 10px; border-top: 1px solid #333;">
+            <div class="stat-row">
+                <span class="label">Avg Height (Y):</span>
+                <span class="value" id="avg-y">0.0</span>
+            </div>
+            <div class="stat-row">
+                <span class="label">Avg Displacement (X):</span>
+                <span class="value" id="avg-x">0.0</span>
+            </div>
+            <div class="stat-row">
+                <span class="label">Avg Distance:</span>
+                <span class="value" id="avg-dist">0.0</span>
+            </div>
+        </div>
     </div>
 
     <canvas id="simCanvas"></canvas>
@@ -113,12 +132,13 @@
     <div class="controls">
         <button onclick="resetAll()">Reset Multiverse</button>
         <button onclick="toggleTrails()">Toggle Trails</button>
+        <button onclick="toggleOverlay()">Toggle Overlay</button>
     </div>
 
 <script>
 /**
- * Parallel Precision Physics Engine
- * Simulates 16 independent rigid body systems to visualize chaos theory.
+ * Parallel Precision Physics Engine with Web Workers
+ * Simulates 64 independent rigid body systems across multiple CPU cores
  */
 
 const canvas = document.getElementById('simCanvas');
@@ -126,189 +146,130 @@ const ctx = canvas.getContext('2d', { alpha: false });
 const graphCanvas = document.getElementById('energy-graph');
 const graphCtx = graphCanvas.getContext('2d');
 
-// --- Physics Constants ---
-const SUB_STEPS = 16; 
-const GRAVITY = 9.81 * 100;
+// --- Constants ---
+const NUM_SYSTEMS = 64;
 const CONTAINER_RADIUS = 300;
 const BALL_RADIUS = 30;
-const BALL_MASS = 10;
-const CONTAINER_MASS = 200;
-const RESTITUTION_NORMAL = 1.0; 
-const RESTITUTION_TANGENT = 1.0; 
 
-// --- Simulation Class ---
-class SimSystem {
-    constructor(id) {
-        this.id = id;
-        this.ball = {};
-        this.container = {};
-        this.initialEnergy = 0;
-        this.reset();
+// --- Worker Pool ---
+const numWorkers = navigator.hardwareConcurrency || 4;
+const workers = [];
+const systemStates = Array(NUM_SYSTEMS).fill(null).map((_, i) => ({
+    id: i,
+    ball: {x: 0, y: -220, angle: 0},
+    container: {angle: 0},
+    history: []
+}));
+
+document.getElementById('worker-count').innerText = numWorkers;
+
+// Distribute systems across workers
+const systemsPerWorker = Math.ceil(NUM_SYSTEMS / numWorkers);
+for (let w = 0; w < numWorkers; w++) {
+    const worker = new Worker('physics-worker.js');
+    const startId = w * systemsPerWorker;
+    const endId = Math.min(startId + systemsPerWorker, NUM_SYSTEMS);
+    const systemIds = [];
+    for (let i = startId; i < endId; i++) {
+        systemIds.push(i);
     }
-
-    reset() {
-        // Chaos Seed: tiny offset in X
-        const randomOffset = (Math.random() * 0.2) - 0.1;
-        
-        this.ball = {
-            x: 1 + randomOffset, 
-            y: -220,
-            vx: 0, vy: 0,
-            angle: 0, angularVelocity: 0,
-            radius: BALL_RADIUS, mass: BALL_MASS, 
-            inertia: 0.5 * BALL_MASS * (BALL_RADIUS * BALL_RADIUS),
-            history: []
-        };
-
-        this.container = {
-            angle: 0, angularVelocity: 0,
-            radius: CONTAINER_RADIUS, mass: CONTAINER_MASS,
-            inertia: CONTAINER_MASS * (CONTAINER_RADIUS * CONTAINER_RADIUS)
-        };
-
-        this.initialEnergy = this.calculateEnergy().total;
-    }
-
-    calculateEnergy() {
-        const b = this.ball;
-        const c = this.container;
-
-        const v2 = b.vx * b.vx + b.vy * b.vy;
-        const keLin = 0.5 * b.mass * v2;
-        const keRotB = 0.5 * b.inertia * (b.angularVelocity * b.angularVelocity);
-        const keRotC = 0.5 * c.inertia * (c.angularVelocity * c.angularVelocity);
-        const pe = -b.mass * GRAVITY * b.y;
-
-        return {
-            total: keLin + keRotB + keRotC + pe,
-            pe: pe
-        };
-    }
-
-    update(dt) {
-        const subDt = dt / SUB_STEPS;
-        const b = this.ball;
-        const c = this.container;
-
-        for (let i = 0; i < SUB_STEPS; i++) {
-            // Integration
-            b.vy += GRAVITY * subDt;
-            b.x += b.vx * subDt;
-            b.y += b.vy * subDt;
-            b.angle += b.angularVelocity * subDt;
-            c.angle += c.angularVelocity * subDt;
-
-            // Collision
-            const distSq = b.x*b.x + b.y*b.y;
-            const dist = Math.sqrt(distSq);
-            const maxDist = c.radius - b.radius;
-
-            if (dist >= maxDist) {
-                const nx = b.x / dist;
-                const ny = b.y / dist;
-
-                // Fix Penetration
-                const pen = dist - maxDist;
-                b.x -= nx * pen;
-                b.y -= ny * pen;
-
-                // Tangent
-                const tx = -ny;
-                const ty = nx;
-
-                // Velocities
-                const vn = b.vx * nx + b.vy * ny;
-                
-                const vt_ball_surf = (b.vx * tx + b.vy * ty) + b.angularVelocity * b.radius;
-                const vt_wall_surf = c.angularVelocity * c.radius;
-                const v_rel_tan = vt_ball_surf - vt_wall_surf;
-
-                if (vn > 0) {
-                    // Normal Impulse
-                    const jn = -(1 + RESTITUTION_NORMAL) * vn * b.mass;
-                    b.vx += (jn * nx) / b.mass;
-                    b.vy += (jn * ny) / b.mass;
-
-                    // Tangent Impulse
-                    const invM = 1 / b.mass;
-                    const invIb = (b.radius * b.radius) / b.inertia;
-                    const invIw = (c.radius * c.radius) / c.inertia;
-                    const effMass = 1 / (invM + invIb + invIw);
-
-                    const jt = -(1 + RESTITUTION_TANGENT) * v_rel_tan * effMass;
-
-                    // Apply
-                    b.vx += (jt * tx) / b.mass;
-                    b.vy += (jt * ty) / b.mass;
-                    b.angularVelocity += (jt * b.radius) / b.inertia;
-                    c.angularVelocity -= (jt * c.radius) / c.inertia;
-                }
-            }
-        }
-        
-        this.correctEnergy();
-    }
-
-    correctEnergy() {
-        if (!this.initialEnergy) return;
-        const stats = this.calculateEnergy();
-        const currentKE = stats.total - stats.pe;
-        const targetKE = this.initialEnergy - stats.pe;
-
-        if (targetKE > 0 && currentKE > 0.000001) {
-            const reqScale = Math.sqrt(targetKE / currentKE);
-            // 10% correction per frame for stability
-            const smoothScale = 1 + (reqScale - 1) * 0.1;
-            
-            this.ball.vx *= smoothScale;
-            this.ball.vy *= smoothScale;
-            this.ball.angularVelocity *= smoothScale;
-            this.container.angularVelocity *= smoothScale;
-        }
-    }
+    
+    worker.systemIds = systemIds;
+    worker.onmessage = handleWorkerMessage;
+    worker.postMessage({ type: 'init', data: { systemIds } });
+    workers.push(worker);
 }
 
-// --- Main App ---
-
-const systems = [];
-for(let i=0; i<16; i++) {
-    systems.push(new SimSystem(i));
-}
+// Fixed timestep variables
+let lastTime = performance.now();
+let accumulator = 0;
+const FIXED_DT = 1/180;
+const MAX_FRAME_TIME = 0.25;
 
 let showTrails = true;
+let showOverlay = false;
+let overlayTransition = 0;
 let totalInitialEnergy = 0;
+let currentTotalEnergy = 0;
 let energyHistory = [];
 let layoutScale = 1;
+let overlayScale = 1;
+let pendingUpdates = 0;
+let initializedWorkers = 0;
+let isReady = false;
+
+function handleWorkerMessage(e) {
+    const { type, states, totalEnergy } = e.data;
+    
+    if (type === 'initialized') {
+        initializedWorkers++;
+        if (initializedWorkers === numWorkers) {
+            isReady = true;
+            resetAll();
+            requestAnimationFrame(loop);
+        }
+    } else if (type === 'updated') {
+        states.forEach(state => {
+            systemStates[state.id].ball = state.ball;
+            systemStates[state.id].container = state.container;
+            systemStates[state.id].initialEnergy = state.initialEnergy;
+        });
+        currentTotalEnergy += totalEnergy;
+        pendingUpdates--;
+    } else if (type === 'reset') {
+        states.forEach(state => {
+            systemStates[state.id].ball = state.ball;
+            systemStates[state.id].container = state.container;
+            systemStates[state.id].initialEnergy = state.initialEnergy;
+        });
+        currentTotalEnergy += totalEnergy;
+        pendingUpdates--;
+        
+        if (pendingUpdates === 0) {
+            totalInitialEnergy = systemStates.reduce((sum, s) => sum + (s.initialEnergy || 0), 0);
+        }
+    }
+}
+
+function lerp(a, b, t) {
+    return a + (b - a) * t;
+}
 
 function resize() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
+    
     graphCanvas.width = graphCanvas.offsetWidth;
     graphCanvas.height = graphCanvas.offsetHeight;
     
-    // Calculate layout scale
-    // We need 4 rows. 
-    // Container Radius is 300. Diameter 600.
-    // With padding, let's say 650 units per cell.
-    // 4 cells high = 2600 units world space.
-    // Screen height / 2600 = scale.
-    const cols = 4; 
-    const rows = 4;
-    const cellUnitSize = (CONTAINER_RADIUS * 2) * 1.1; // 10% padding
+    if (energyHistory.length > graphCanvas.width) {
+        energyHistory = energyHistory.slice(energyHistory.length - graphCanvas.width);
+    }
     
-    // Fit width or height
+    const cols = 8; 
+    const rows = 8;
+    const cellUnitSize = (CONTAINER_RADIUS * 2) * 1.1;
+    
     const scaleH = window.innerHeight / (rows * cellUnitSize);
     const scaleW = window.innerWidth / (cols * cellUnitSize);
-    layoutScale = Math.min(scaleH, scaleW) * 0.95; // 95% to leave margin
+    layoutScale = Math.min(scaleH, scaleW) * 0.95;
+    
+    const overlayUnitSize = (CONTAINER_RADIUS * 2) * 1.05;
+    const overlayScaleH = window.innerHeight / overlayUnitSize;
+    const overlayScaleW = window.innerWidth / overlayUnitSize;
+    overlayScale = Math.min(overlayScaleH, overlayScaleW) * 0.98;
 }
 window.addEventListener('resize', resize);
 resize();
 
 function resetAll() {
-    systems.forEach(s => s.reset());
-    systems.forEach(s => s.ball.history = []);
+    pendingUpdates = numWorkers;
+    currentTotalEnergy = 0;
+    workers.forEach(worker => {
+        worker.postMessage({ type: 'reset' });
+    });
+    systemStates.forEach(s => s.history = []);
     energyHistory = [];
-    totalInitialEnergy = systems.reduce((sum, s) => sum + s.initialEnergy, 0);
 }
 
 function updateGraph(currentTotal) {
@@ -322,7 +283,6 @@ function updateGraph(currentTotal) {
     
     graphCtx.clearRect(0, 0, w, h);
     
-    // Baseline
     graphCtx.beginPath();
     graphCtx.strokeStyle = '#444';
     graphCtx.setLineDash([5, 5]);
@@ -331,11 +291,10 @@ function updateGraph(currentTotal) {
     graphCtx.stroke();
     graphCtx.setLineDash([]);
     
-    // Plot
     graphCtx.beginPath();
     graphCtx.strokeStyle = '#0f0';
     graphCtx.lineWidth = 2;
-    const scale = 5000; // Zoomed in deviation
+    const scale = 5000;
     
     for (let i = 0; i < energyHistory.length; i++) {
         const val = energyHistory[i];
@@ -348,112 +307,151 @@ function updateGraph(currentTotal) {
 }
 
 function loop() {
-    const dt = 1/180;
+    const currentTime = performance.now();
+    let frameTime = (currentTime - lastTime) / 1000;
+    lastTime = currentTime;
     
-    // Update
-    let currentTotalEnergy = 0;
-    systems.forEach(s => {
-        s.update(dt);
-        currentTotalEnergy += s.calculateEnergy().total;
-    });
+    if (frameTime > MAX_FRAME_TIME) frameTime = MAX_FRAME_TIME;
     
-    // Update Stats
-    if(totalInitialEnergy === 0) totalInitialEnergy = currentTotalEnergy;
+    accumulator += frameTime;
+    
+    while (accumulator >= FIXED_DT) {
+        pendingUpdates = numWorkers;
+        currentTotalEnergy = 0;
+        workers.forEach(worker => {
+            worker.postMessage({ type: 'update', data: { dt: FIXED_DT } });
+        });
+        accumulator -= FIXED_DT;
+    }
+    
+    const transitionSpeed = 5.0;
+    const targetTransition = showOverlay ? 1 : 0;
+    overlayTransition = lerp(overlayTransition, targetTransition, frameTime * transitionSpeed);
+    
+    // Show/hide overlay stats
+    document.getElementById('overlay-stats').style.display = showOverlay ? 'block' : 'none';
+    
+    // Calculate overlay statistics
+    if (showOverlay) {
+        let sumX = 0, sumY = 0, sumDist = 0;
+        let count = 0;
+        systemStates.forEach(s => {
+            if (s.ball && s.ball.x !== undefined && s.ball.y !== undefined) {
+                sumX += s.ball.x;
+                sumY += s.ball.y;
+                sumDist += Math.sqrt(s.ball.x * s.ball.x + s.ball.y * s.ball.y);
+                count++;
+            }
+        });
+        if (count > 0) {
+            document.getElementById('avg-x').innerText = (sumX / count).toFixed(1);
+            document.getElementById('avg-y').innerText = (sumY / count).toFixed(1);
+            document.getElementById('avg-dist').innerText = (sumDist / count).toFixed(1);
+        }
+    }
+    
     document.getElementById('total-e').innerText = (currentTotalEnergy / 1000).toFixed(1) + "k";
     
-    const dev = ((currentTotalEnergy - totalInitialEnergy) / totalInitialEnergy) * 100;
-    const devEl = document.getElementById('deviation');
-    devEl.innerText = (dev > 0 ? "+" : "") + dev.toPrecision(3) + "%";
+    const dev = totalInitialEnergy > 0 ? ((currentTotalEnergy - totalInitialEnergy) / totalInitialEnergy) * 100 : 0;
+    document.getElementById('deviation').innerText = (dev > 0 ? "+" : "") + dev.toPrecision(3) + "%";
     
     updateGraph(currentTotalEnergy);
     
-    // Render
     ctx.fillStyle = '#222';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
     
-    const rows = 4;
-    const cols = 4;
+    const rows = 8;
+    const cols = 8;
     const cellW = canvas.width / cols;
     const cellH = canvas.height / rows;
     
-    systems.forEach((s, i) => {
+    const alpha = lerp(1.0, Math.sqrt(1.0 / NUM_SYSTEMS), overlayTransition);
+    ctx.globalAlpha = alpha;
+    
+    systemStates.forEach((s, i) => {
         const col = i % cols;
         const row = Math.floor(i / cols);
+        const gridX = col * cellW + cellW/2;
+        const gridY = row * cellH + cellH/2;
         
-        const cx = col * cellW + cellW/2;
-        const cy = row * cellH + cellH/2;
+        const overlayX = canvas.width / 2;
+        const overlayY = canvas.height / 2;
+        
+        const cx = lerp(gridX, overlayX, overlayTransition);
+        const cy = lerp(gridY, overlayY, overlayTransition);
+        
+        const currentScale = lerp(layoutScale, overlayScale, overlayTransition);
         
         ctx.save();
         ctx.translate(cx, cy);
-        ctx.scale(layoutScale, layoutScale);
+        ctx.scale(currentScale, currentScale);
         
-        // Draw Container
         ctx.save();
         ctx.rotate(s.container.angle);
         ctx.beginPath();
-        ctx.arc(0, 0, s.container.radius, 0, Math.PI * 2);
+        ctx.arc(0, 0, CONTAINER_RADIUS, 0, Math.PI * 2);
         ctx.lineWidth = 4;
         ctx.strokeStyle = '#555';
         ctx.stroke();
         
-        // Spokes (simplified)
         ctx.strokeStyle = '#333';
         ctx.lineWidth = 2;
         ctx.beginPath();
-        ctx.moveTo(-s.container.radius, 0);
-        ctx.lineTo(s.container.radius, 0);
-        ctx.moveTo(0, -s.container.radius);
-        ctx.lineTo(0, s.container.radius);
+        ctx.moveTo(-CONTAINER_RADIUS, 0);
+        ctx.lineTo(CONTAINER_RADIUS, 0);
+        ctx.moveTo(0, -CONTAINER_RADIUS);
+        ctx.lineTo(0, CONTAINER_RADIUS);
         ctx.stroke();
         ctx.restore();
         
-        // Draw Trail
         if (showTrails) {
-            s.ball.history.push({x: s.ball.x, y: s.ball.y});
-            if (s.ball.history.length > 200) s.ball.history.shift();
+            s.history.push({x: s.ball.x, y: s.ball.y});
+            if (s.history.length > 200) s.history.shift();
             
             ctx.beginPath();
-            ctx.strokeStyle = `hsl(${(i * 360/16)}, 70%, 60%)`; // Different color per instance
+            ctx.strokeStyle = `hsl(${(i * 360/NUM_SYSTEMS)}, 70%, 60%)`;
             ctx.lineWidth = 3;
-            for (let k = 0; k < s.ball.history.length - 1; k++) {
-                ctx.moveTo(s.ball.history[k].x, s.ball.history[k].y);
-                ctx.lineTo(s.ball.history[k+1].x, s.ball.history[k+1].y);
+            for (let k = 0; k < s.history.length - 1; k++) {
+                ctx.moveTo(s.history[k].x, s.history[k].y);
+                ctx.lineTo(s.history[k+1].x, s.history[k+1].y);
             }
             ctx.stroke();
         }
         
-        // Draw Ball
         ctx.save();
         ctx.translate(s.ball.x, s.ball.y);
         ctx.rotate(s.ball.angle);
         
         ctx.beginPath();
-        ctx.arc(0, 0, s.ball.radius, 0, Math.PI * 2);
+        ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2);
         ctx.fillStyle = '#eee';
         ctx.fill();
         
-        // Orientation
         ctx.beginPath();
         ctx.moveTo(0, 0);
-        ctx.lineTo(s.ball.radius, 0);
+        ctx.lineTo(BALL_RADIUS, 0);
         ctx.strokeStyle = '#000';
         ctx.lineWidth = 3;
         ctx.stroke();
         
-        ctx.restore(); // Ball
-        ctx.restore(); // Cell
+        ctx.restore();
+        ctx.restore();
     });
-
+    
+    ctx.globalAlpha = 1.0;
     requestAnimationFrame(loop);
 }
 
 function toggleTrails() {
     showTrails = !showTrails;
-    if(!showTrails) systems.forEach(s => s.ball.history = []);
+    if(!showTrails) systemStates.forEach(s => s.history = []);
 }
 
-resetAll();
-requestAnimationFrame(loop);
+function toggleOverlay() {
+    showOverlay = !showOverlay;
+}
+
+// Workers will initialize and start automatically
 
 </script>
 </body>
