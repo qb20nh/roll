@@ -131,13 +131,19 @@ class SimSystem {
         const targetKE = this.initialEnergy - stats.pe;
 
         if (targetKE > 0.000001 && currentKE > 0.000001) {
-            const reqScale = Math.sqrt(targetKE / currentKE);
-            const smoothScale = 1 + (reqScale - 1) * 0.1;
+            let scale = Math.sqrt(targetKE / currentKE);
             
-            this.ball.vx *= smoothScale;
-            this.ball.vy *= smoothScale;
-            this.ball.angularVelocity *= smoothScale;
-            this.container.angularVelocity *= smoothScale;
+            // Clamp scale to prevent instability from large corrections
+            // Allows up to 1% adjustment per correction step
+            scale = Math.max(0.99, Math.min(1.01, scale));
+            
+            // Safety check for NaN/Infinity
+            if (!Number.isFinite(scale)) return;
+            
+            this.ball.vx *= scale;
+            this.ball.vy *= scale;
+            this.ball.angularVelocity *= scale;
+            this.container.angularVelocity *= scale;
         }
     }
 

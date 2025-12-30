@@ -191,6 +191,7 @@ let showOverlay = false;
 let overlayTransition = 0;
 let totalInitialEnergy = 0;
 let currentTotalEnergy = 0;
+let displayedTotalEnergy = 0;
 let energyHistory = [];
 let layoutScale = 1;
 let overlayScale = 1;
@@ -216,17 +217,22 @@ function handleWorkerMessage(e) {
         });
         currentTotalEnergy += totalEnergy;
         pendingUpdates--;
+        if (pendingUpdates === 0) {
+            displayedTotalEnergy = currentTotalEnergy;
+        }
     } else if (type === 'reset') {
         states.forEach(state => {
             systemStates[state.id].ball = state.ball;
             systemStates[state.id].container = state.container;
             systemStates[state.id].initialEnergy = state.initialEnergy;
+            systemStates[state.id].history = [];
         });
         currentTotalEnergy += totalEnergy;
         pendingUpdates--;
         
         if (pendingUpdates === 0) {
             totalInitialEnergy = systemStates.reduce((sum, s) => sum + (s.initialEnergy || 0), 0);
+            displayedTotalEnergy = currentTotalEnergy;
         }
     }
 }
@@ -268,7 +274,6 @@ function resetAll() {
     workers.forEach(worker => {
         worker.postMessage({ type: 'reset' });
     });
-    systemStates.forEach(s => s.history = []);
     energyHistory = [];
 }
 
@@ -316,6 +321,8 @@ function loop() {
     accumulator += frameTime;
     
     while (accumulator >= FIXED_DT) {
+        // Don't send updates while waiting for responses (reset or update)
+        if (pendingUpdates > 0) break;
         pendingUpdates = numWorkers;
         currentTotalEnergy = 0;
         workers.forEach(worker => {
@@ -350,12 +357,13 @@ function loop() {
         }
     }
     
-    document.getElementById('total-e').innerText = (currentTotalEnergy / 1000).toFixed(1) + "k";
+    document.getElementById('total-e').innerText = (displayedTotalEnergy / 1000).toFixed(1) + "k";
     
-    const dev = totalInitialEnergy > 0 ? ((currentTotalEnergy - totalInitialEnergy) / totalInitialEnergy) * 100 : 0;
-    document.getElementById('deviation').innerText = (dev > 0 ? "+" : "") + dev.toPrecision(3) + "%";
+    const dev = totalInitialEnergy > 0 ? ((displayedTotalEnergy - totalInitialEnergy) / totalInitialEnergy) * 100 : 0;
+    const devDisplay = Math.abs(dev) < 0.001 ? "0.00" : (dev > 0 ? "+" : "") + dev.toPrecision(3);
+    document.getElementById('deviation').innerText = devDisplay + "%";
     
-    updateGraph(currentTotalEnergy);
+    updateGraph(displayedTotalEnergy);
     
     ctx.fillStyle = '#222';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
@@ -368,26 +376,29 @@ function loop() {
     const alpha = lerp(1.0, Math.sqrt(1.0 / NUM_SYSTEMS), overlayTransition);
     ctx.globalAlpha = alpha;
     
-    systemStates.forEach((s, i) => {
+    // Helper to calculate position and scale for a system
+    function getSystemTransform(i) {
         const col = i % cols;
         const row = Math.floor(i / cols);
         const gridX = col * cellW + cellW/2;
         const gridY = row * cellH + cellH/2;
-        
         const overlayX = canvas.width / 2;
         const overlayY = canvas.height / 2;
-        
-        const cx = lerp(gridX, overlayX, overlayTransition);
-        const cy = lerp(gridY, overlayY, overlayTransition);
-        
-        const currentScale = lerp(layoutScale, overlayScale, overlayTransition);
-        
+        return {
+            cx: lerp(gridX, overlayX, overlayTransition),
+            cy: lerp(gridY, overlayY, overlayTransition),
+            scale: lerp(layoutScale, overlayScale, overlayTransition)
+        };
+    }
+    
+    // Pass 1: Draw all container circles and crosshairs
+    systemStates.forEach((s, i) => {
+        const { cx, cy, scale } = getSystemTransform(i);
         ctx.save();
         ctx.translate(cx, cy);
-        ctx.scale(currentScale, currentScale);
-        
-        ctx.save();
+        ctx.scale(scale, scale);
         ctx.rotate(s.container.angle);
+        
         ctx.beginPath();
         ctx.arc(0, 0, CONTAINER_RADIUS, 0, Math.PI * 2);
         ctx.lineWidth = 4;
@@ -402,11 +413,20 @@ function loop() {
         ctx.moveTo(0, -CONTAINER_RADIUS);
         ctx.lineTo(0, CONTAINER_RADIUS);
         ctx.stroke();
-        ctx.restore();
         
-        if (showTrails) {
+        ctx.restore();
+    });
+    
+    // Pass 2: Draw all trails
+    if (showTrails) {
+        systemStates.forEach((s, i) => {
             s.history.push({x: s.ball.x, y: s.ball.y});
             if (s.history.length > 200) s.history.shift();
+            
+            const { cx, cy, scale } = getSystemTransform(i);
+            ctx.save();
+            ctx.translate(cx, cy);
+            ctx.scale(scale, scale);
             
             ctx.beginPath();
             ctx.strokeStyle = `hsl(${(i * 360/NUM_SYSTEMS)}, 70%, 60%)`;
@@ -416,9 +436,17 @@ function loop() {
                 ctx.lineTo(s.history[k+1].x, s.history[k+1].y);
             }
             ctx.stroke();
-        }
-        
+            
+            ctx.restore();
+        });
+    }
+    
+    // Pass 3: Draw all balls
+    systemStates.forEach((s, i) => {
+        const { cx, cy, scale } = getSystemTransform(i);
         ctx.save();
+        ctx.translate(cx, cy);
+        ctx.scale(scale, scale);
         ctx.translate(s.ball.x, s.ball.y);
         ctx.rotate(s.ball.angle);
         
@@ -434,7 +462,6 @@ function loop() {
         ctx.lineWidth = 3;
         ctx.stroke();
         
-        ctx.restore();
         ctx.restore();
     });
     
