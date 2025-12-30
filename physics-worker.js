@@ -11,6 +11,7 @@ const CONTAINER_MASS = 200;
 const RESTITUTION_NORMAL = 1.0; 
 const RESTITUTION_TANGENT = 1.0; 
 const NUM_SYSTEMS = 64;
+const STATE_STRIDE = 4; // ballX, ballY, ballAngle, containerAngle
 
 // --- Simulation Class ---
 class SimSystem {
@@ -31,8 +32,7 @@ class SimSystem {
             vx: 0, vy: 0,
             angle: 0, angularVelocity: 0,
             radius: BALL_RADIUS, mass: BALL_MASS, 
-            inertia: 0.5 * BALL_MASS * (BALL_RADIUS * BALL_RADIUS),
-            history: []
+            inertia: 0.5 * BALL_MASS * (BALL_RADIUS * BALL_RADIUS)
         };
 
         this.container = {
@@ -64,69 +64,88 @@ class SimSystem {
         const subDt = dt / SUB_STEPS;
         const b = this.ball;
         const c = this.container;
+        const gravitySubDt = GRAVITY * subDt;
+        const rB = b.radius;
+        const rC = c.radius;
+        const maxDist = rC - rB;
+        const maxDistSq = maxDist * maxDist;
+
+        const invMass = 1 / b.mass;
+        const invInertiaB = 1 / b.inertia;
+        const invInertiaC = 1 / c.inertia;
+
+        // Effective mass for tangential impulse (constant for this system)
+        const invM = invMass;
+        const invIb = (rB * rB) * invInertiaB;
+        const invIw = (rC * rC) * invInertiaC;
+        const effMass = 1 / (invM + invIb + invIw);
 
         for (let i = 0; i < SUB_STEPS; i++) {
             // Integration
-            b.vy += GRAVITY * subDt;
+            b.vy += gravitySubDt;
             b.x += b.vx * subDt;
             b.y += b.vy * subDt;
             b.angle += b.angularVelocity * subDt;
             c.angle += c.angularVelocity * subDt;
 
             // Collision
-            const distSq = b.x*b.x + b.y*b.y;
-            const dist = Math.sqrt(distSq);
-            const maxDist = c.radius - b.radius;
+            const x = b.x;
+            const y = b.y;
+            const distSq = x * x + y * y;
 
-            if (dist >= maxDist) {
-                const nx = b.x / dist;
-                const ny = b.y / dist;
+            // Avoid sqrt unless we might be colliding.
+            if (distSq >= maxDistSq) {
+                const dist = Math.sqrt(distSq);
+                if (dist <= 0) continue;
 
-                // Fix Penetration
+                const invDist = 1 / dist;
+                const nx = x * invDist;
+                const ny = y * invDist;
+
+                // Fix penetration (only if needed)
                 const pen = dist - maxDist;
-                b.x -= nx * pen;
-                b.y -= ny * pen;
+                if (pen > 0) {
+                    b.x -= nx * pen;
+                    b.y -= ny * pen;
+                }
 
                 // Tangent
                 const tx = -ny;
                 const ty = nx;
 
-                // Velocities
+                // Normal velocity
                 const vn = b.vx * nx + b.vy * ny;
-                
-                const vt_ball_surf = (b.vx * tx + b.vy * ty) + b.angularVelocity * b.radius;
-                const vt_wall_surf = c.angularVelocity * c.radius;
-                const v_rel_tan = vt_ball_surf - vt_wall_surf;
 
                 if (vn > 0) {
-                    // Normal Impulse
-                    const jn = -(1 + RESTITUTION_NORMAL) * vn * b.mass;
-                    b.vx += (jn * nx) / b.mass;
-                    b.vy += (jn * ny) / b.mass;
+                    // Normal impulse: j/m simplifies to -(1+e)*vn
+                    const impulseN = -(1 + RESTITUTION_NORMAL) * vn;
+                    b.vx += impulseN * nx;
+                    b.vy += impulseN * ny;
 
-                    // Tangent Impulse
-                    const invM = 1 / b.mass;
-                    const invIb = (b.radius * b.radius) / b.inertia;
-                    const invIw = (c.radius * c.radius) / c.inertia;
-                    const effMass = 1 / (invM + invIb + invIw);
+                    // Tangential relative velocity at contact
+                    const vtBallSurf = (b.vx * tx + b.vy * ty) + (b.angularVelocity * rB);
+                    const vtWallSurf = c.angularVelocity * rC;
+                    const vRelTan = vtBallSurf - vtWallSurf;
 
-                    const jt = -(1 + RESTITUTION_TANGENT) * v_rel_tan * effMass;
+                    // Tangential impulse
+                    const jt = -(1 + RESTITUTION_TANGENT) * vRelTan * effMass;
 
                     // Apply
-                    b.vx += (jt * tx) / b.mass;
-                    b.vy += (jt * ty) / b.mass;
-                    b.angularVelocity += (jt * b.radius) / b.inertia;
-                    c.angularVelocity -= (jt * c.radius) / c.inertia;
+                    const jtInvMass = jt * invMass;
+                    b.vx += jtInvMass * tx;
+                    b.vy += jtInvMass * ty;
+                    b.angularVelocity += jt * rB * invInertiaB;
+                    c.angularVelocity -= jt * rC * invInertiaC;
                 }
             }
         }
         
-        this.correctEnergy();
+        const stats = this.calculateEnergy();
+        return this.correctEnergy(stats);
     }
 
-    correctEnergy() {
-        if (!this.initialEnergy || this.initialEnergy < 0.000001) return;
-        const stats = this.calculateEnergy();
+    correctEnergy(stats) {
+        if (!this.initialEnergy || this.initialEnergy < 0.000001) return stats.total;
         const currentKE = stats.total - stats.pe;
         const targetKE = this.initialEnergy - stats.pe;
 
@@ -138,75 +157,110 @@ class SimSystem {
             scale = Math.max(0.99, Math.min(1.01, scale));
             
             // Safety check for NaN/Infinity
-            if (!Number.isFinite(scale)) return;
+            if (!Number.isFinite(scale)) return stats.total;
             
-            this.ball.vx *= scale;
-            this.ball.vy *= scale;
-            this.ball.angularVelocity *= scale;
-            this.container.angularVelocity *= scale;
-        }
-    }
+            if (scale !== 1) {
+                this.ball.vx *= scale;
+                this.ball.vy *= scale;
+                this.ball.angularVelocity *= scale;
+                this.container.angularVelocity *= scale;
+            }
 
-    // Serialize for message passing
-    serialize() {
-        return {
-            id: this.id,
-            ball: {
-                x: this.ball.x,
-                y: this.ball.y,
-                angle: this.ball.angle,
-                vx: this.ball.vx,
-                vy: this.ball.vy,
-                angularVelocity: this.ball.angularVelocity
-            },
-            container: {
-                angle: this.container.angle,
-                angularVelocity: this.container.angularVelocity
-            },
-            initialEnergy: this.initialEnergy
-        };
+            return stats.pe + currentKE * scale * scale;
+        }
+
+        return stats.total;
     }
 }
 
 // Worker state
 let systems = [];
+let systemIds = [];
 
 // Message handler
 self.onmessage = function(e) {
-    const { type, data } = e.data;
+    const msg = e.data;
+    const type = msg?.type;
     
     switch(type) {
         case 'init':
             // Initialize systems for this worker
-            systems = data.systemIds.map(id => new SimSystem(id));
+            systemIds = msg.systemIds ?? msg.data?.systemIds ?? [];
+            systems = systemIds.map((id) => new SimSystem(id));
             self.postMessage({ type: 'initialized' });
             break;
             
         case 'update':
-            // Update all systems
-            const dt = data.dt;
-            systems.forEach(s => s.update(dt));
-            
-            // Send back state
-            const states = systems.map(s => s.serialize());
-            const totalEnergy = systems.reduce((sum, s) => sum + s.calculateEnergy().total, 0);
-            
-            self.postMessage({ 
-                type: 'updated',
-                states: states,
-                totalEnergy: totalEnergy
-            });
+            // Update all systems and write compact state to an output buffer.
+            {
+                const dt = msg.dt ?? msg.data?.dt;
+                const batchId = msg.batchId;
+                const expectedFloats = systems.length * STATE_STRIDE;
+                let buffer = msg.buffer;
+                if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== expectedFloats * 4) {
+                    buffer = new ArrayBuffer(expectedFloats * 4);
+                }
+
+                const out = new Float32Array(buffer);
+                let totalEnergy = 0;
+
+                for (let i = 0; i < systems.length; i++) {
+                    const s = systems[i];
+                    totalEnergy += s.update(dt);
+
+                    const base = i * STATE_STRIDE;
+                    out[base] = s.ball.x;
+                    out[base + 1] = s.ball.y;
+                    out[base + 2] = s.ball.angle;
+                    out[base + 3] = s.container.angle;
+                }
+
+                self.postMessage(
+                    {
+                        type: 'updated',
+                        batchId,
+                        buffer,
+                        totalEnergy
+                    },
+                    [buffer]
+                );
+            }
             break;
             
         case 'reset':
-            systems.forEach(s => s.reset(s.id));
-            const resetStates = systems.map(s => s.serialize());
-            const resetEnergy = systems.reduce((sum, s) => sum + s.calculateEnergy().total, 0);
-            self.postMessage({ 
-                type: 'reset',
-                states: resetStates,
-                totalEnergy: resetEnergy
-            });
+            {
+                const batchId = msg.batchId;
+                const expectedFloats = systems.length * STATE_STRIDE;
+                let buffer = msg.buffer;
+                if (!(buffer instanceof ArrayBuffer) || buffer.byteLength !== expectedFloats * 4) {
+                    buffer = new ArrayBuffer(expectedFloats * 4);
+                }
+
+                const out = new Float32Array(buffer);
+                let totalEnergy = 0;
+
+                for (let i = 0; i < systems.length; i++) {
+                    const s = systems[i];
+                    s.reset(s.id);
+                    totalEnergy += s.initialEnergy;
+
+                    const base = i * STATE_STRIDE;
+                    out[base] = s.ball.x;
+                    out[base + 1] = s.ball.y;
+                    out[base + 2] = s.ball.angle;
+                    out[base + 3] = s.container.angle;
+                }
+
+                self.postMessage(
+                    {
+                        type: 'reset',
+                        batchId,
+                        buffer,
+                        totalEnergy
+                    },
+                    [buffer]
+                );
+            }
             break;
     }
 };

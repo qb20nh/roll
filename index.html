@@ -37,14 +37,6 @@
             backdrop-filter: blur(4px);
         }
 
-        h1 {
-            font-size: 16px;
-            margin: 0 0 10px 0;
-            color: #4db8ff;
-            text-transform: uppercase;
-            letter-spacing: 1px;
-        }
-
         .stat-row {
             display: flex;
             justify-content: space-between;
@@ -92,7 +84,6 @@
 <body>
 
     <div id="ui-layer">
-        <h1>Multiverse Stats (64x)</h1>
         <div class="stat-row">
             <span class="label">Systems Active:</span>
             <span class="value">64</span>
@@ -142,14 +133,29 @@
  */
 
 const canvas = document.getElementById('simCanvas');
-const ctx = canvas.getContext('2d', { alpha: false });
+const ctx = canvas.getContext('2d', { alpha: false, desynchronized: true });
 const graphCanvas = document.getElementById('energy-graph');
-const graphCtx = graphCanvas.getContext('2d');
+const graphCtx = graphCanvas.getContext('2d', { desynchronized: true });
+
+const workerCountEl = document.getElementById('worker-count');
+const totalEEl = document.getElementById('total-e');
+const deviationEl = document.getElementById('deviation');
+const overlayStatsEl = document.getElementById('overlay-stats');
+const avgXEl = document.getElementById('avg-x');
+const avgYEl = document.getElementById('avg-y');
+const avgDistEl = document.getElementById('avg-dist');
 
 // --- Constants ---
 const NUM_SYSTEMS = 64;
 const CONTAINER_RADIUS = 300;
 const BALL_RADIUS = 30;
+const TWO_PI = Math.PI * 2;
+const OVERLAY_ALPHA = Math.sqrt(1 / NUM_SYSTEMS);
+const GRID_COLS = 8;
+const GRID_ROWS = 8;
+const STATE_STRIDE = 4; // ballX, ballY, ballAngle, containerAngle (must match worker)
+const TRAIL_LENGTH = 200;
+const UI_UPDATE_INTERVAL_MS = 1000 / 30;
 
 // --- Worker Pool ---
 const numWorkers = navigator.hardwareConcurrency || 4;
@@ -158,10 +164,28 @@ const systemStates = Array(NUM_SYSTEMS).fill(null).map((_, i) => ({
     id: i,
     ball: {x: 0, y: -220, angle: 0},
     container: {angle: 0},
-    history: []
+    trailX: new Float32Array(TRAIL_LENGTH),
+    trailY: new Float32Array(TRAIL_LENGTH),
+    trailHead: 0,
+    trailSize: 0
 }));
 
-document.getElementById('worker-count').innerText = numWorkers;
+const trailColors = Array(NUM_SYSTEMS);
+for (let i = 0; i < NUM_SYSTEMS; i++) {
+    trailColors[i] = `hsl(${(i * 360 / NUM_SYSTEMS)}, 70%, 60%)`;
+}
+
+const gridCx = new Float32Array(NUM_SYSTEMS);
+const gridCy = new Float32Array(NUM_SYSTEMS);
+const drawCx = new Float32Array(NUM_SYSTEMS);
+const drawCy = new Float32Array(NUM_SYSTEMS);
+let cellW = 0;
+let cellH = 0;
+let overlayCenterX = 0;
+let overlayCenterY = 0;
+let lastUiUpdate = 0;
+
+workerCountEl.textContent = String(numWorkers);
 
 // Distribute systems across workers
 const systemsPerWorker = Math.ceil(NUM_SYSTEMS / numWorkers);
@@ -175,8 +199,9 @@ for (let w = 0; w < numWorkers; w++) {
     }
     
     worker.systemIds = systemIds;
-    worker.onmessage = handleWorkerMessage;
-    worker.postMessage({ type: 'init', data: { systemIds } });
+    worker.stateBuffer = new ArrayBuffer(systemIds.length * STATE_STRIDE * 4);
+    worker.onmessage = (e) => handleWorkerMessage(worker, e);
+    worker.postMessage({ type: 'init', systemIds });
     workers.push(worker);
 }
 
@@ -198,9 +223,22 @@ let overlayScale = 1;
 let pendingUpdates = 0;
 let initializedWorkers = 0;
 let isReady = false;
+let activeBatchId = 0;
 
-function handleWorkerMessage(e) {
-    const { type, states, totalEnergy } = e.data;
+function expectedWorkerBufferBytes(worker) {
+    return worker.systemIds.length * STATE_STRIDE * 4;
+}
+
+function ensureWorkerBuffer(worker) {
+    const expectedBytes = expectedWorkerBufferBytes(worker);
+    if (!(worker.stateBuffer instanceof ArrayBuffer) || worker.stateBuffer.byteLength !== expectedBytes) {
+        worker.stateBuffer = new ArrayBuffer(expectedBytes);
+    }
+    return worker.stateBuffer;
+}
+
+function handleWorkerMessage(worker, e) {
+    const { type } = e.data;
     
     if (type === 'initialized') {
         initializedWorkers++;
@@ -209,36 +247,71 @@ function handleWorkerMessage(e) {
             resetAll();
             requestAnimationFrame(loop);
         }
-    } else if (type === 'updated') {
-        states.forEach(state => {
-            systemStates[state.id].ball = state.ball;
-            systemStates[state.id].container = state.container;
-            systemStates[state.id].initialEnergy = state.initialEnergy;
-        });
-        currentTotalEnergy += totalEnergy;
-        pendingUpdates--;
-        if (pendingUpdates === 0) {
-            displayedTotalEnergy = currentTotalEnergy;
+        return;
+    }
+
+    if (type === 'updated' || type === 'reset') {
+        const { batchId, buffer, totalEnergy } = e.data;
+
+        // Always reclaim the worker's buffer (even for stale batches).
+        if (buffer instanceof ArrayBuffer) {
+            worker.stateBuffer = buffer;
         }
-    } else if (type === 'reset') {
-        states.forEach(state => {
-            systemStates[state.id].ball = state.ball;
-            systemStates[state.id].container = state.container;
-            systemStates[state.id].initialEnergy = state.initialEnergy;
-            systemStates[state.id].history = [];
-        });
+
+        // Ignore stale responses (e.g., reset issued mid-update).
+        if (batchId !== activeBatchId) return;
+
+        const isReset = type === 'reset';
+        const floats = new Float32Array(worker.stateBuffer);
+        const ids = worker.systemIds;
+        for (let i = 0; i < ids.length; i++) {
+            const id = ids[i];
+            const base = i * STATE_STRIDE;
+            const s = systemStates[id];
+            s.ball.x = floats[base];
+            s.ball.y = floats[base + 1];
+            s.ball.angle = floats[base + 2];
+            s.container.angle = floats[base + 3];
+
+            // Prevent a "teleport" segment: drop any trail points sampled while reset was pending.
+            if (isReset) {
+                s.trailHead = 0;
+                s.trailSize = 0;
+            }
+        }
+
         currentTotalEnergy += totalEnergy;
         pendingUpdates--;
-        
         if (pendingUpdates === 0) {
-            totalInitialEnergy = systemStates.reduce((sum, s) => sum + (s.initialEnergy || 0), 0);
             displayedTotalEnergy = currentTotalEnergy;
+            if (type === 'reset') {
+                // Reset energy is the initial energy baseline.
+                totalInitialEnergy = displayedTotalEnergy;
+            }
         }
     }
 }
 
 function lerp(a, b, t) {
     return a + (b - a) * t;
+}
+
+function clearTrails() {
+    for (let i = 0; i < NUM_SYSTEMS; i++) {
+        const s = systemStates[i];
+        s.trailHead = 0;
+        s.trailSize = 0;
+    }
+}
+
+function pushTrailPoint(s, x, y) {
+    const head = s.trailHead;
+    s.trailX[head] = x;
+    s.trailY[head] = y;
+
+    const nextHead = head + 1;
+    s.trailHead = nextHead === TRAIL_LENGTH ? 0 : nextHead;
+    if (s.trailSize < TRAIL_LENGTH) s.trailSize++;
 }
 
 function resize() {
@@ -252,27 +325,44 @@ function resize() {
         energyHistory = energyHistory.slice(energyHistory.length - graphCanvas.width);
     }
     
-    const cols = 8; 
-    const rows = 8;
+    cellW = canvas.width / GRID_COLS;
+    cellH = canvas.height / GRID_ROWS;
+    overlayCenterX = canvas.width * 0.5;
+    overlayCenterY = canvas.height * 0.5;
+
+    for (let i = 0; i < NUM_SYSTEMS; i++) {
+        const col = i % GRID_COLS;
+        const row = (i / GRID_COLS) | 0;
+        gridCx[i] = col * cellW + cellW * 0.5;
+        gridCy[i] = row * cellH + cellH * 0.5;
+    }
+
     const cellUnitSize = (CONTAINER_RADIUS * 2) * 1.1;
     
-    const scaleH = window.innerHeight / (rows * cellUnitSize);
-    const scaleW = window.innerWidth / (cols * cellUnitSize);
+    const scaleH = canvas.height / (GRID_ROWS * cellUnitSize);
+    const scaleW = canvas.width / (GRID_COLS * cellUnitSize);
     layoutScale = Math.min(scaleH, scaleW) * 0.95;
     
     const overlayUnitSize = (CONTAINER_RADIUS * 2) * 1.05;
-    const overlayScaleH = window.innerHeight / overlayUnitSize;
-    const overlayScaleW = window.innerWidth / overlayUnitSize;
+    const overlayScaleH = canvas.height / overlayUnitSize;
+    const overlayScaleW = canvas.width / overlayUnitSize;
     overlayScale = Math.min(overlayScaleH, overlayScaleW) * 0.98;
 }
 window.addEventListener('resize', resize);
 resize();
 
 function resetAll() {
+    activeBatchId++;
     pendingUpdates = numWorkers;
     currentTotalEnergy = 0;
+
+    // Clear trails/history immediately (don't wait for worker replies).
+    clearTrails();
+    lastUiUpdate = 0;
+
     workers.forEach(worker => {
-        worker.postMessage({ type: 'reset' });
+        const buffer = ensureWorkerBuffer(worker);
+        worker.postMessage({ type: 'reset', batchId: activeBatchId, buffer }, [buffer]);
     });
     energyHistory = [];
 }
@@ -323,10 +413,12 @@ function loop() {
     while (accumulator >= FIXED_DT) {
         // Don't send updates while waiting for responses (reset or update)
         if (pendingUpdates > 0) break;
+        activeBatchId++;
         pendingUpdates = numWorkers;
         currentTotalEnergy = 0;
         workers.forEach(worker => {
-            worker.postMessage({ type: 'update', data: { dt: FIXED_DT } });
+            const buffer = ensureWorkerBuffer(worker);
+            worker.postMessage({ type: 'update', batchId: activeBatchId, dt: FIXED_DT, buffer }, [buffer]);
         });
         accumulator -= FIXED_DT;
     }
@@ -335,76 +427,63 @@ function loop() {
     const targetTransition = showOverlay ? 1 : 0;
     overlayTransition = lerp(overlayTransition, targetTransition, frameTime * transitionSpeed);
     
-    // Show/hide overlay stats
-    document.getElementById('overlay-stats').style.display = showOverlay ? 'block' : 'none';
-    
-    // Calculate overlay statistics
-    if (showOverlay) {
-        let sumX = 0, sumY = 0, sumDist = 0;
-        let count = 0;
-        systemStates.forEach(s => {
-            if (s.ball && s.ball.x !== undefined && s.ball.y !== undefined) {
-                sumX += s.ball.x;
-                sumY += s.ball.y;
-                sumDist += Math.sqrt(s.ball.x * s.ball.x + s.ball.y * s.ball.y);
-                count++;
+    if ((currentTime - lastUiUpdate) >= UI_UPDATE_INTERVAL_MS) {
+        lastUiUpdate = currentTime;
+
+        if (showOverlay) {
+            let sumX = 0;
+            let sumY = 0;
+            let sumDist = 0;
+            for (let i = 0; i < NUM_SYSTEMS; i++) {
+                const b = systemStates[i].ball;
+                const x = b.x;
+                const y = b.y;
+                sumX += x;
+                sumY += y;
+                sumDist += Math.sqrt(x * x + y * y);
             }
-        });
-        if (count > 0) {
-            document.getElementById('avg-x').innerText = (sumX / count).toFixed(1);
-            document.getElementById('avg-y').innerText = (sumY / count).toFixed(1);
-            document.getElementById('avg-dist').innerText = (sumDist / count).toFixed(1);
+
+            const invCount = 1 / NUM_SYSTEMS;
+            avgXEl.textContent = (sumX * invCount).toFixed(1);
+            avgYEl.textContent = (sumY * invCount).toFixed(1);
+            avgDistEl.textContent = (sumDist * invCount).toFixed(1);
         }
+
+        totalEEl.textContent = (displayedTotalEnergy / 1000).toFixed(1) + "k";
+
+        const dev = totalInitialEnergy > 0 ? ((displayedTotalEnergy - totalInitialEnergy) / totalInitialEnergy) * 100 : 0;
+        const devDisplay = Math.abs(dev) < 0.001 ? "0.00" : (dev > 0 ? "+" : "") + dev.toPrecision(3);
+        deviationEl.textContent = devDisplay + "%";
+
+        updateGraph(displayedTotalEnergy);
     }
-    
-    document.getElementById('total-e').innerText = (displayedTotalEnergy / 1000).toFixed(1) + "k";
-    
-    const dev = totalInitialEnergy > 0 ? ((displayedTotalEnergy - totalInitialEnergy) / totalInitialEnergy) * 100 : 0;
-    const devDisplay = Math.abs(dev) < 0.001 ? "0.00" : (dev > 0 ? "+" : "") + dev.toPrecision(3);
-    document.getElementById('deviation').innerText = devDisplay + "%";
-    
-    updateGraph(displayedTotalEnergy);
-    
+
     ctx.fillStyle = '#222';
     ctx.fillRect(0, 0, canvas.width, canvas.height);
-    
-    const rows = 8;
-    const cols = 8;
-    const cellW = canvas.width / cols;
-    const cellH = canvas.height / rows;
-    
-    const alpha = lerp(1.0, Math.sqrt(1.0 / NUM_SYSTEMS), overlayTransition);
-    ctx.globalAlpha = alpha;
-    
-    // Helper to calculate position and scale for a system
-    function getSystemTransform(i) {
-        const col = i % cols;
-        const row = Math.floor(i / cols);
-        const gridX = col * cellW + cellW/2;
-        const gridY = row * cellH + cellH/2;
-        const overlayX = canvas.width / 2;
-        const overlayY = canvas.height / 2;
-        return {
-            cx: lerp(gridX, overlayX, overlayTransition),
-            cy: lerp(gridY, overlayY, overlayTransition),
-            scale: lerp(layoutScale, overlayScale, overlayTransition)
-        };
+
+    const t = overlayTransition;
+    const systemScale = lerp(layoutScale, overlayScale, t);
+
+    ctx.globalAlpha = lerp(1.0, OVERLAY_ALPHA, t);
+
+    // Precompute per-system draw positions for this frame (avoid per-pass recalculation/allocations).
+    for (let i = 0; i < NUM_SYSTEMS; i++) {
+        drawCx[i] = lerp(gridCx[i], overlayCenterX, t);
+        drawCy[i] = lerp(gridCy[i], overlayCenterY, t);
     }
-    
+
     // Pass 1: Draw all container circles and crosshairs
-    systemStates.forEach((s, i) => {
-        const { cx, cy, scale } = getSystemTransform(i);
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.scale(scale, scale);
-        ctx.rotate(s.container.angle);
-        
+    for (let i = 0; i < NUM_SYSTEMS; i++) {
+        const s = systemStates[i];
+        ctx.setTransform(systemScale, 0, 0, systemScale, drawCx[i], drawCy[i]);
+
         ctx.beginPath();
-        ctx.arc(0, 0, CONTAINER_RADIUS, 0, Math.PI * 2);
+        ctx.arc(0, 0, CONTAINER_RADIUS, 0, TWO_PI);
         ctx.lineWidth = 4;
         ctx.strokeStyle = '#555';
         ctx.stroke();
-        
+
+        ctx.rotate(s.container.angle);
         ctx.strokeStyle = '#333';
         ctx.lineWidth = 2;
         ctx.beginPath();
@@ -413,69 +492,72 @@ function loop() {
         ctx.moveTo(0, -CONTAINER_RADIUS);
         ctx.lineTo(0, CONTAINER_RADIUS);
         ctx.stroke();
-        
-        ctx.restore();
-    });
-    
+    }
+
     // Pass 2: Draw all trails
     if (showTrails) {
-        systemStates.forEach((s, i) => {
-            s.history.push({x: s.ball.x, y: s.ball.y});
-            if (s.history.length > 200) s.history.shift();
-            
-            const { cx, cy, scale } = getSystemTransform(i);
-            ctx.save();
-            ctx.translate(cx, cy);
-            ctx.scale(scale, scale);
-            
+        for (let i = 0; i < NUM_SYSTEMS; i++) {
+            const s = systemStates[i];
+            pushTrailPoint(s, s.ball.x, s.ball.y);
+
+            const size = s.trailSize;
+            if (size < 2) continue;
+
+            ctx.setTransform(systemScale, 0, 0, systemScale, drawCx[i], drawCy[i]);
+
             ctx.beginPath();
-            ctx.strokeStyle = `hsl(${(i * 360/NUM_SYSTEMS)}, 70%, 60%)`;
+            ctx.strokeStyle = trailColors[i];
             ctx.lineWidth = 3;
-            for (let k = 0; k < s.history.length - 1; k++) {
-                ctx.moveTo(s.history[k].x, s.history[k].y);
-                ctx.lineTo(s.history[k+1].x, s.history[k+1].y);
+
+            let idx = s.trailHead - size;
+            if (idx < 0) idx += TRAIL_LENGTH;
+            ctx.moveTo(s.trailX[idx], s.trailY[idx]);
+
+            for (let k = 1; k < size; k++) {
+                idx++;
+                if (idx === TRAIL_LENGTH) idx = 0;
+                ctx.lineTo(s.trailX[idx], s.trailY[idx]);
             }
+
             ctx.stroke();
-            
-            ctx.restore();
-        });
+        }
     }
-    
+
     // Pass 3: Draw all balls
-    systemStates.forEach((s, i) => {
-        const { cx, cy, scale } = getSystemTransform(i);
-        ctx.save();
-        ctx.translate(cx, cy);
-        ctx.scale(scale, scale);
+    ctx.fillStyle = '#eee';
+    ctx.strokeStyle = '#000';
+    ctx.lineWidth = 3;
+
+    for (let i = 0; i < NUM_SYSTEMS; i++) {
+        const s = systemStates[i];
+        ctx.setTransform(systemScale, 0, 0, systemScale, drawCx[i], drawCy[i]);
         ctx.translate(s.ball.x, s.ball.y);
         ctx.rotate(s.ball.angle);
-        
+
         ctx.beginPath();
-        ctx.arc(0, 0, BALL_RADIUS, 0, Math.PI * 2);
-        ctx.fillStyle = '#eee';
+        ctx.arc(0, 0, BALL_RADIUS, 0, TWO_PI);
         ctx.fill();
-        
+
         ctx.beginPath();
         ctx.moveTo(0, 0);
         ctx.lineTo(BALL_RADIUS, 0);
-        ctx.strokeStyle = '#000';
-        ctx.lineWidth = 3;
         ctx.stroke();
-        
-        ctx.restore();
-    });
-    
+    }
+
+    ctx.setTransform(1, 0, 0, 1, 0, 0);
     ctx.globalAlpha = 1.0;
     requestAnimationFrame(loop);
 }
 
 function toggleTrails() {
     showTrails = !showTrails;
-    if(!showTrails) systemStates.forEach(s => s.history = []);
+    if (!showTrails) clearTrails();
 }
 
 function toggleOverlay() {
     showOverlay = !showOverlay;
+    overlayStatsEl.style.display = showOverlay ? 'block' : 'none';
+    lastUiUpdate = 0;
 }
 
 // Workers will initialize and start automatically
